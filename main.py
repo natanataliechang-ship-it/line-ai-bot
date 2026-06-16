@@ -9,12 +9,14 @@ app = FastAPI()
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")
-NOTION_INVESTMENT_DB_ID = os.environ.get("NOTION_INVESTMENT_DB_ID")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID")           # 獵頭 + 行程
+NOTION_INVESTMENT_DB_ID = os.environ.get("NOTION_INVESTMENT_DB_ID") # 投資記錄
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")                       # Groq（免費）
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
+# 投資相關關鍵字
 INVESTMENT_KEYWORDS = [
     "買入", "賣出", "轉入", "轉出", "持倉", "加倉", "減倉",
     "BTC", "ETH", "SOL", "USDT", "BNB", "XRP", "DOGE",
@@ -28,18 +30,26 @@ def is_investment_message(text: str) -> bool:
     return any(kw.upper() in text_upper for kw in INVESTMENT_KEYWORDS)
 
 
-async def call_gemini(prompt: str) -> str:
+async def call_groq(prompt: str) -> str:
+    """呼叫 Groq API"""
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+            },
             timeout=30,
         )
-        print(f"Gemini status: {response.status_code}")
-        print(f"Gemini response: {response.text[:300]}")
+        print(f"Groq status: {response.status_code}")
         result = response.json()
-        content = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        content = result["choices"][0]["message"]["content"].strip()
+        # 移除可能的 markdown code block
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
@@ -48,6 +58,7 @@ async def call_gemini(prompt: str) -> str:
 
 
 async def parse_investment(text: str) -> dict:
+    """解析投資訊息"""
     today = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""你是投資記錄助理，請解析以下加密貨幣交易訊息。
 今天是 {today}。
@@ -64,11 +75,12 @@ async def parse_investment(text: str) -> dict:
 }}
 
 訊息：{text}"""
-    content = await call_gemini(prompt)
+    content = await call_groq(prompt)
     return json.loads(content)
 
 
 async def parse_work_event(text: str) -> dict:
+    """解析獵頭 / 行程訊息"""
     today = datetime.now().strftime("%Y-%m-%d")
     prompt = f"""你是獵頭助理，解析老闆傳來的快速記錄訊息。今天是 {today}。
 
@@ -83,14 +95,23 @@ async def parse_work_event(text: str) -> dict:
   "時間": "HH:MM，沒有填空字串"
 }}
 
+分類：
+- 行程：一般會議、電話、個人事項
+- 面試安排：安排面試、確認時間
+- 候選人更新：面試結果、意願、狀態
+- CV送出：把履歷送給客戶
+- 客戶回饋：客戶對候選人的看法
+- 其他：無法歸類
+
 訊息：{text}"""
-    content = await call_gemini(prompt)
+    content = await call_groq(prompt)
     return json.loads(content)
 
 
 async def add_investment_to_notion(parsed: dict, original_text: str) -> dict:
     coin = parsed.get("幣種", "未知")
     trade_type = parsed.get("交易類型", "其他")
+
     properties = {
         "幣種": {"title": [{"text": {"content": f"{trade_type} {coin}"}}]},
         "交易類型": {"select": {"name": trade_type}},
@@ -104,6 +125,7 @@ async def add_investment_to_notion(parsed: dict, original_text: str) -> dict:
         properties["單價"] = {"rich_text": [{"text": {"content": f"{parsed['單價']} {unit}".strip()}}]}
     if parsed.get("備註"):
         properties["備註"] = {"rich_text": [{"text": {"content": parsed["備註"]}}]}
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://api.notion.com/v1/pages",
@@ -115,12 +137,13 @@ async def add_investment_to_notion(parsed: dict, original_text: str) -> dict:
             json={"parent": {"database_id": NOTION_INVESTMENT_DB_ID}, "properties": properties},
             timeout=30,
         )
-        print(f"Notion investment response: {response.status_code} {response.text[:200]}")
+        print(f"Notion investment: {response.status_code}")
         return response.json()
 
 
 async def add_work_to_notion(parsed: dict, original_text: str) -> dict:
     title = parsed.get("重點") or original_text[:80]
+
     properties = {
         "內容": {"title": [{"text": {"content": title}}]},
         "類型": {"select": {"name": parsed.get("類型", "其他")}},
@@ -135,6 +158,7 @@ async def add_work_to_notion(parsed: dict, original_text: str) -> dict:
         properties["候選人"] = {"rich_text": [{"text": {"content": parsed["候選人"]}}]}
     if parsed.get("客戶公司"):
         properties["客戶公司"] = {"rich_text": [{"text": {"content": parsed["客戶公司"]}}]}
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://api.notion.com/v1/pages",
@@ -146,7 +170,7 @@ async def add_work_to_notion(parsed: dict, original_text: str) -> dict:
             json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": properties},
             timeout=30,
         )
-        print(f"Notion work response: {response.status_code} {response.text[:200]}")
+        print(f"Notion work: {response.status_code} {response.text[:200]}")
         return response.json()
 
 
@@ -183,8 +207,10 @@ async def webhook(request: Request):
                     parsed = await parse_investment(user_text)
                     notion_page = await add_investment_to_notion(parsed, user_text)
                     page_url = notion_page.get("url", "")
+
                     qty = str(parsed["數量"]) if parsed.get("數量") is not None else "－"
                     price = f"{parsed['單價']} {parsed.get('貨幣單位') or ''}".strip() if parsed.get("單價") else "－"
+
                     reply = (
                         f"💰 投資記錄已存！\n\n"
                         f"🪙 幣種：{parsed.get('幣種', '－')}\n"
@@ -197,12 +223,15 @@ async def webhook(request: Request):
                         reply += f"\n📝 備註：{parsed['備註']}"
                     if page_url:
                         reply += f"\n\n🔗 {page_url}"
+
                 else:
                     parsed = await parse_work_event(user_text)
                     notion_page = await add_work_to_notion(parsed, user_text)
                     page_url = notion_page.get("url", "")
+
                     type_name = parsed.get("類型", "其他")
                     emoji = TYPE_EMOJI.get(type_name, "📝")
+
                     reply = f"✅ 已記錄！\n\n{emoji} 類型：{type_name}\n📌 重點：{parsed.get('重點', user_text)}"
                     if parsed.get("候選人"):
                         reply += f"\n👤 候選人：{parsed['候選人']}"
